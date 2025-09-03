@@ -1,0 +1,408 @@
+-- Xellant Hub - Entrenched (Fluent, v2.2)
+-- ESP + Aimbot (FOV circle, wallcheck, prediction, keybind) + Misc (Noclip / InfJump / Camera FOV) + FullBright
+-- Fluent SaveManager + InterfaceManager integrated into Settings tab (configs + autoload)
+-- Circular "X" button: always visible, draggable (position saved), toggles hub ScreenGui.
+-- MinimizeKey (RightCtrl) uses Fluent's built-in minimize behavior.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
+local Camera = Workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+
+-- ===== Load Fluent + Addons =====
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
+local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
+
+-- ===== Window =====
+local Window = Fluent:CreateWindow({
+    Title = "Xellant Hub - Entrenched",
+    SubTitle = "v2.2",
+    TabWidth = 150,
+    Size = UDim2.fromOffset(560, 420),
+    Acrylic = false,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.RightControl, -- Fluent's built-in minimize
+})
+
+-- ===== Tabs =====
+local Tabs = {
+    Help      = Window:AddTab({ Title = "Help", Icon = "" }),
+    Visuals   = Window:AddTab({ Title = "Visuals", Icon = "" }),
+    Combat    = Window:AddTab({ Title = "Combat", Icon = "" }),
+    Misc      = Window:AddTab({ Title = "Misc", Icon = "" }),
+    Settings  = Window:AddTab({ Title = "Settings", Icon = "settings" })
+}
+
+local Options = Fluent.Options
+
+-- ===== Xellant Local Settings (for things NOT covered by Fluent Options) =====
+local SETTINGS_FILE = "XellantHubSettings.json"
+local DEFAULTS = {
+    ESP = { Boxes=false, Lines=false, TeamColors=false },
+    Aimbot = { Enabled=false, WallCheck=false, Keybind="V", FOV=150, Prediction=0.15, FOVCircle=true },
+    Misc = { Noclip=false, InfJump=false, FOV=70, FullBright=false },
+    UI = { QuickTogglePos = { x = 0.90, y = 0.20 } } -- normalized viewport pos for the round X
+}
+local function deepClone(t) return HttpService:JSONDecode(HttpService:JSONEncode(t)) end
+local function deepMerge(dst, src) for k,v in pairs(src) do if type(v)=="table" then dst[k]=dst[k] or {}; deepMerge(dst[k],v) else dst[k]=v end end end
+local Xellant = deepClone(DEFAULTS)
+local function SaveLocal() pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(Xellant)) end) end
+local function LoadLocal()
+    pcall(function()
+        if isfile(SETTINGS_FILE) then
+            local saved = HttpService:JSONDecode(readfile(SETTINGS_FILE))
+            Xellant = deepClone(DEFAULTS); deepMerge(Xellant, saved)
+        end
+    end)
+end
+LoadLocal()
+
+-- ===== Hub toggling helpers =====
+local function findFluentGui()
+    for _,g in ipairs(CoreGui:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Name:lower():find("fluent") then
+            return g
+        end
+    end
+    return nil
+end
+
+local function toggleHubEnabled()
+    local gui = findFluentGui()
+    if gui then gui.Enabled = not gui.Enabled end
+end
+
+-- ===== ESP =====
+local espConns = {}
+local function ClearESP()
+    for _,c in ipairs(espConns) do pcall(function() c:Disconnect() end) end
+    espConns = {}
+    for _,plr in ipairs(Players:GetPlayers()) do
+        if plr.Character and plr.Character:FindFirstChild("ESP_Outline") then
+            plr.Character.ESP_Outline:Destroy()
+        end
+    end
+end
+
+local function EnsureESP(char, color)
+    local h = char:FindFirstChild("ESP_Outline")
+    if not h then
+        h = Instance.new("Highlight")
+        h.Name = "ESP_Outline"
+        h.Adornee = char
+        h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        h.Parent = char
+    end
+    h.OutlineColor = color
+    h.OutlineTransparency = (Xellant.ESP.Lines and 0) or 1
+    h.FillTransparency    = (Xellant.ESP.Boxes and 0.7) or 1
+end
+
+local function UpdateESP(plr)
+    if not (Xellant.ESP.Boxes or Xellant.ESP.Lines) then
+        if plr.Character and plr.Character:FindFirstChild("ESP_Outline") then
+            plr.Character.ESP_Outline:Destroy()
+        end
+        return
+    end
+    local c = plr.Character ; if not c then return end
+    local hum = c:FindFirstChildOfClass("Humanoid")
+    local root = c:FindFirstChild("HumanoidRootPart")
+    if not hum or not root or hum.Health <= 0 then
+        if c:FindFirstChild("ESP_Outline") then c.ESP_Outline:Destroy() end
+        return
+    end
+    local color = (Xellant.ESP.TeamColors and plr.Team == LocalPlayer.Team) and Color3.fromRGB(0,255,0) or Color3.fromRGB(255,0,0)
+    EnsureESP(c, color)
+end
+
+local function StartESP()
+    ClearESP()
+    table.insert(espConns, RunService.RenderStepped:Connect(function()
+        for _,plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then UpdateESP(plr) end
+        end
+    end))
+end
+
+-- ===== Aimbot + FOV circle =====
+local aiming = false
+
+local fovCircle = Drawing.new("Circle")
+fovCircle.Thickness = 1
+fovCircle.NumSides = 64
+fovCircle.Filled = false
+fovCircle.Color = Color3.fromRGB(255, 255, 255)
+fovCircle.Transparency = 1
+fovCircle.Radius = Xellant.Aimbot.FOV or 150
+fovCircle.Visible = Xellant.Aimbot.FOVCircle
+
+local function IsVisible(part)
+    if not Xellant.Aimbot.WallCheck then return true end
+    local origin = Camera.CFrame.Position
+    local dir = (part.Position - origin).Unit * 1000
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    params.FilterType = Enum.RaycastFilterType.Blacklist
+    local result = Workspace:Raycast(origin, dir, params)
+    return result and result.Instance:IsDescendantOf(part.Parent)
+end
+
+local function GetNearestEnemy()
+    local myChar = LocalPlayer.Character ; if not myChar then return nil end
+    local myRoot = myChar:FindFirstChild("HumanoidRootPart"); if not myRoot then return nil end
+    local best, bestDiff = nil, math.huge
+    for _,plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Team ~= LocalPlayer.Team then
+            local c = plr.Character
+            if c then
+                local head = c:FindFirstChild("Head")
+                local hum  = c:FindFirstChildOfClass("Humanoid")
+                local root = c:FindFirstChild("HumanoidRootPart")
+                if head and hum and root and hum.Health > 0 then
+                    if (head.Position - myRoot.Position).Magnitude < 700 and IsVisible(head) then
+                        local sp, on = Camera:WorldToViewportPoint(head.Position)
+                        if on then
+                            local mouse = UserInputService:GetMouseLocation()
+                            local diff = (Vector2.new(sp.X, sp.Y) - mouse).Magnitude
+                            if diff < (Xellant.Aimbot.FOV or 150) and diff < bestDiff then
+                                bestDiff = diff
+                                best = { head=head, vel=root.Velocity }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+RunService.RenderStepped:Connect(function()
+    -- FOV circle follow
+    local mouse = UserInputService:GetMouseLocation()
+    fovCircle.Position = Vector2.new(mouse.X, mouse.Y)
+    fovCircle.Radius = Xellant.Aimbot.FOV or 150
+
+    -- hide FOV only when hub is OPEN (ScreenGui.Enabled == true AND main frame visible)
+    local gui = findFluentGui()
+    local mainVisible = false
+    if gui then
+        local main = gui:FindFirstChildWhichIsA("Frame", true)
+        mainVisible = (main and main.Visible) or false
+    end
+    local hubOpen = gui and gui.Enabled and mainVisible
+    fovCircle.Visible = Xellant.Aimbot.FOVCircle and Xellant.Aimbot.Enabled and (not hubOpen)
+
+    -- aimbot
+    if aiming and Xellant.Aimbot.Enabled then
+        local t = GetNearestEnemy()
+        if t then
+            local predTime = Xellant.Aimbot.Prediction or 0.15
+            local target = t.head.Position + (t.vel * predTime)
+            Camera.CFrame = CFrame.new(Camera.CFrame.Position, target)
+        end
+    end
+end)
+
+UserInputService.InputBegan:Connect(function(i,gp)
+    if gp then return end
+    if i.KeyCode and i.KeyCode.Name:upper() == string.upper(Xellant.Aimbot.Keybind or "V") then
+        aiming = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(i,gp)
+    if i.KeyCode and i.KeyCode.Name:upper() == string.upper(Xellant.Aimbot.Keybind or "V") then
+        aiming = false
+    end
+end)
+
+-- ===== FullBright (no post-effects) =====
+local FBConn, storedLighting, storedEffects = nil, nil, {}
+local function disablePostEffects()
+    for _, obj in ipairs(Lighting:GetChildren()) do
+        if obj:IsA("PostEffect") or obj:IsA("BloomEffect") or obj:IsA("SunRaysEffect") or obj:IsA("DepthOfFieldEffect") or obj:IsA("ColorCorrectionEffect") then
+            if storedEffects[obj] == nil then storedEffects[obj] = obj.Enabled end
+            obj.Enabled = false
+        end
+        if obj:IsA("Atmosphere") then
+            if storedEffects[obj] == nil then storedEffects[obj] = {
+                Density=obj.Density, Offset=obj.Offset, Color=obj.Color, Decay=obj.Decay
+            } end
+            obj.Density=0; obj.Offset=0; obj.Color=Color3.new(1,1,1); obj.Decay=Color3.new(1,1,1)
+        end
+    end
+end
+local function restorePostEffects()
+    for inst, prev in pairs(storedEffects) do
+        if inst and inst.Parent then
+            if typeof(prev)=="boolean" then inst.Enabled = prev
+            elseif typeof(prev)=="table" and inst:IsA("Atmosphere") then
+                inst.Density=prev.Density; inst.Offset=prev.Offset; inst.Color=prev.Color; inst.Decay=prev.Decay
+            end
+        end
+    end
+    storedEffects = {}
+end
+local function ApplyFullBright(state)
+    if state then
+        if not storedLighting then
+            storedLighting = {
+                ClockTime = Lighting.ClockTime,
+                Brightness = Lighting.Brightness,
+                FogStart = Lighting.FogStart,
+                FogEnd = Lighting.FogEnd,
+                GlobalShadows = Lighting.GlobalShadows,
+                Ambient = Lighting.Ambient,
+                OutdoorAmbient = Lighting.OutdoorAmbient,
+                ExposureCompensation = Lighting.ExposureCompensation,
+            }
+        end
+        local function forceBright()
+            Lighting.ClockTime = 12
+            Lighting.Brightness = 2
+            Lighting.FogStart = 0
+            Lighting.FogEnd = 1e6
+            Lighting.GlobalShadows = false
+            Lighting.Ambient = Color3.new(1,1,1)
+            Lighting.OutdoorAmbient = Color3.new(1,1,1)
+            Lighting.ExposureCompensation = 0
+            disablePostEffects()
+        end
+        forceBright()
+        if not FBConn then FBConn = RunService.RenderStepped:Connect(forceBright) end
+    else
+        if FBConn then FBConn:Disconnect(); FBConn=nil end
+        if storedLighting then
+            for k,v in pairs(storedLighting) do Lighting[k]=v end
+            storedLighting = nil
+        end
+        restorePostEffects()
+    end
+end
+
+-- ===== Misc =====
+local noclip = Xellant.Misc.Noclip or false
+RunService.Stepped:Connect(function()
+    if noclip and LocalPlayer.Character then
+        for _,p in ipairs(LocalPlayer.Character:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+        end
+    end
+end)
+
+local infiniteJump = Xellant.Misc.InfJump or false
+UserInputService.JumpRequest:Connect(function()
+    if infiniteJump then
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end)
+
+
+-- ===== UI: Help =====
+Tabs.Help:AddParagraph({
+    Title = "How to Use",
+    Content = "• Right Ctrl = Fluent minimize (built-in)\n• Circle X = Toggle the whole hub on/off\n• Aimbot keybind default = V (hold)\n• FOV circle hides while hub is open"
+})
+
+-- ===== UI: Visuals =====
+Tabs.Visuals:AddToggle("esp_boxes", { Title="ESP Boxes", Default=Xellant.ESP.Boxes or false }):OnChanged(function(v)
+    Xellant.ESP.Boxes = Options.esp_boxes.Value; SaveLocal(); StartESP()
+end)
+Tabs.Visuals:AddToggle("esp_lines", { Title="ESP Lines", Default=Xellant.ESP.Lines or false }):OnChanged(function(v)
+    Xellant.ESP.Lines = Options.esp_lines.Value; SaveLocal(); StartESP()
+end)
+Tabs.Visuals:AddToggle("esp_team", { Title="Team Colors", Default=Xellant.ESP.TeamColors or false }):OnChanged(function(v)
+    Xellant.ESP.TeamColors = Options.esp_team.Value; SaveLocal(); StartESP()
+end)
+
+-- ===== UI: Combat =====
+Tabs.Combat:AddToggle("aim_enable", { Title="Enable Aimbot", Default=Xellant.Aimbot.Enabled or false }):OnChanged(function()
+    Xellant.Aimbot.Enabled = Options.aim_enable.Value; SaveLocal()
+end)
+Tabs.Combat:AddToggle("aim_wall", { Title="Wall Check", Default=Xellant.Aimbot.WallCheck or false }):OnChanged(function()
+    Xellant.Aimbot.WallCheck = Options.aim_wall.Value; SaveLocal()
+end)
+Tabs.Combat:AddToggle("aim_fovcircle", { Title="Show FOV Circle", Default=Xellant.Aimbot.FOVCircle ~= false }):OnChanged(function()
+    Xellant.Aimbot.FOVCircle = Options.aim_fovcircle.Value; SaveLocal()
+end)
+Tabs.Combat:AddSlider("aim_fov", {
+    Title="Aimbot FOV", Min=50, Max=400, Default=Xellant.Aimbot.FOV or 150, Rounding=0,
+    Callback=function(v) Xellant.Aimbot.FOV = v; SaveLocal() end
+})
+Tabs.Combat:AddSlider("aim_pred", {
+    Title="Prediction (sec)", Min=0, Max=0.30, Default=Xellant.Aimbot.Prediction or 0.15, Rounding=3,
+    Callback=function(v) Xellant.Aimbot.Prediction = v; SaveLocal() end
+})
+Tabs.Combat:AddButton({ Title="Set Aimbot Keybind (current: "..(Xellant.Aimbot.Keybind or "V")..")", Callback=function()
+    Fluent:Notify({ Title="Keybind", Content="Press a key within 5s..." })
+    local sel; local conn
+    conn = UserInputService.InputBegan:Connect(function(i,gp)
+        if gp then return end
+        if i.KeyCode and i.KeyCode.Name ~= "Unknown" then sel = i.KeyCode.Name; conn:Disconnect() end
+    end)
+    task.wait(5) ; if conn then pcall(function() conn:Disconnect() end) end
+    if sel then Xellant.Aimbot.Keybind = sel; SaveLocal(); Fluent:Notify({ Title="Keybind", Content="Aimbot key set to "..sel }) end
+end })
+
+-- ===== UI: Misc =====
+Tabs.Misc:AddSlider("misc_fov", {
+    Title="Camera FOV", Min=50, Max=120, Default=Xellant.Misc.FOV or 70, Rounding=0,
+    Callback=function(v) Xellant.Misc.FOV=v; SaveLocal(); Camera.FieldOfView=v end
+})
+Tabs.Misc:AddToggle("misc_noclip", { Title="Noclip", Default=Xellant.Misc.Noclip or false }):OnChanged(function()
+    Xellant.Misc.Noclip = Options.misc_noclip.Value; SaveLocal()
+end)
+Tabs.Misc:AddToggle("misc_infjump", { Title="Infinite Jump", Default=Xellant.Misc.InfJump or false }):OnChanged(function()
+    Xellant.Misc.InfJump = Options.misc_infjump.Value; SaveLocal()
+end)
+Tabs.Misc:AddToggle("misc_fullbright", { Title="FullBright (remove glare)", Default=Xellant.Misc.FullBright or false }):OnChanged(function()
+    Xellant.Misc.FullBright = Options.misc_fullbright.Value; SaveLocal(); ApplyFullBright(Xellant.Misc.FullBright)
+end)
+
+-- ===== UI: Settings (SaveManager + InterfaceManager sections) =====
+SaveManager:SetLibrary(Fluent)
+InterfaceManager:SetLibrary(Fluent)
+
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({}) -- keep empty (we want to save all options)
+InterfaceManager:SetFolder("XellantHub")
+SaveManager:SetFolder("XellantHub/Entrenched")
+
+InterfaceManager:BuildInterfaceSection(Tabs.Settings)
+SaveManager:BuildConfigSection(Tabs.Settings)
+
+Tabs.Settings:AddButton({ Title="Save Local (XellantHubSettings.json)", Callback=function()
+    SaveLocal()
+    Fluent:Notify({ Title="Saved", Content="Local settings saved." })
+end })
+Tabs.Settings:AddButton({ Title="Reset Local (delete file)", Callback=function()
+    pcall(function() delfile(SETTINGS_FILE) end)
+    Fluent:Notify({ Title="Reset", Content="Deleted local settings file. Re-run script." })
+end })
+Tabs.Settings:AddButton({ Title="Destroy Hub", Callback=function()
+    if FBConn then FBConn:Disconnect(); FBConn=nil end
+    restorePostEffects()
+    ClearESP()
+    local gui = findFluentGui()
+    if gui then gui:Destroy() end
+    QuickGui:Destroy()
+    fovCircle.Visible=false
+end })
+
+-- Auto-load last config if one is marked for autoload
+SaveManager:LoadAutoloadConfig()
+
+-- ===== Kickoff =====
+Fluent:Notify({ Title="Xellant", Content="Loaded. Right Ctrl = Minimize. Enjoy!" })
+StartESP()
+Camera.FieldOfView = Xellant.Misc.FOV or 70
+if Xellant.Misc.FullBright then ApplyFullBright(true) end
+Window:SelectTab(1)
